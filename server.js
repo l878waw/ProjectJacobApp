@@ -18,16 +18,52 @@ function allowedOrigin(origin) {
   return allowed.has(origin) ? origin : PUBLIC_URL;
 }
 
-function sendJson(res, status, body, origin) {
+function sendJson(res, status, body, origin, options = {}) {
+  const payload = JSON.stringify(body);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(payload),
     'Access-Control-Allow-Origin': allowedOrigin(origin),
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Vary': 'Origin',
     'Cache-Control': 'no-store'
   });
-  res.end(JSON.stringify(body));
+  res.end(options.headOnly ? '' : payload);
+}
+
+function sendRedirect(res, location, origin, options = {}) {
+  const payload = `Redirecting to ${location}`;
+  res.writeHead(302, {
+    'Location': location,
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Content-Length': Buffer.byteLength(payload),
+    'Access-Control-Allow-Origin': allowedOrigin(origin),
+    'Vary': 'Origin',
+    'Cache-Control': 'no-store'
+  });
+  res.end(options.headOnly ? '' : payload);
+}
+
+function sendServiceWorker(res, origin, options = {}) {
+  const script = [
+    "self.addEventListener('install', () => self.skipWaiting());",
+    "self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));",
+    ''
+  ].join('\n');
+  res.writeHead(200, {
+    'Content-Type': 'application/javascript; charset=utf-8',
+    'Content-Length': Buffer.byteLength(script),
+    'Access-Control-Allow-Origin': allowedOrigin(origin),
+    'Service-Worker-Allowed': '/',
+    'Cache-Control': 'no-store',
+    'Vary': 'Origin'
+  });
+  res.end(options.headOnly ? '' : script);
+}
+
+function acceptsHtml(req) {
+  return String(req.headers.accept || '').includes('text/html');
 }
 
 async function readJson(req, maxBytes = 1024 * 1024) {
@@ -143,6 +179,8 @@ async function saveCheckIn(req, res, origin) {
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const isHead = req.method === 'HEAD';
+  const method = isHead ? 'GET' : req.method;
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -155,7 +193,7 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  if (req.method === 'GET' && url.pathname === '/health') {
+  if (method === 'GET' && url.pathname === '/health') {
     return sendJson(res, 200, {
       status: 'ok',
       service: 'project-jacob-api',
@@ -165,27 +203,35 @@ const server = http.createServer(async (req, res) => {
         openai: Boolean(process.env.OPENAI_API_KEY),
         elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY)
       }
-    }, origin);
+    }, origin, { headOnly: isHead });
   }
 
-  if (req.method === 'GET' && url.pathname === '/') {
+  if (method === 'GET' && url.pathname === '/') {
+    if (!isHead && acceptsHtml(req)) {
+      return sendRedirect(res, PUBLIC_URL, origin);
+    }
+
     return sendJson(res, 200, {
       name: 'Project Jacob API',
       status: 'online',
       frontend: PUBLIC_URL,
       endpoints: ['/health', 'POST /api/speak', 'POST /api/checkins']
-    }, origin);
+    }, origin, { headOnly: isHead });
   }
 
-  if (req.method === 'POST' && url.pathname === '/api/speak') {
+  if (method === 'GET' && url.pathname === '/service-worker.js') {
+    return sendServiceWorker(res, origin, { headOnly: isHead });
+  }
+
+  if (method === 'POST' && url.pathname === '/api/speak') {
     return speak(req, res, origin);
   }
 
-  if (req.method === 'POST' && url.pathname === '/api/checkins') {
+  if (method === 'POST' && url.pathname === '/api/checkins') {
     return saveCheckIn(req, res, origin);
   }
 
-  return sendJson(res, 404, { error: 'Not found' }, origin);
+  return sendJson(res, 404, { error: 'Not found' }, origin, { headOnly: isHead });
 });
 
 server.on('clientError', (err, socket) => {
