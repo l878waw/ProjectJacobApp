@@ -1,11 +1,12 @@
 const { app, BrowserWindow } = require('electron');
-const path = require('path');
+
+const PROJECT_JACOB_URL = 'https://project-jacob-kris-project-jacob.vercel.app/';
 
 function createWindow() {
     const win = new BrowserWindow({
         width: 500,
         height: 700,
-        title: "Project Jacob",
+        title: 'Project Jacob',
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true
@@ -13,7 +14,7 @@ function createWindow() {
         autoHideMenuBar: true
     });
 
-    win.loadURL('https://project-jacob.vercel.app/');
+    win.loadURL(PROJECT_JACOB_URL);
 }
 
 app.whenReady().then(() => {
