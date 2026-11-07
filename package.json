@@ -17,5 +17,8 @@
   ],
   "author": "",
   "license": "ISC",
-  "type": "commonjs"
+  "type": "commonjs",
+  "dependencies": {
+    "@runwayml/sdk": "^4.24.0"
+  }
 }

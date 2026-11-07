@@ -1,11 +1,21 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { default: RunwayML, TaskFailedError, TaskTimedOutError, AbortError } = require('@runwayml/sdk');
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = '0.0.0.0';
 const DATA_DIR = process.env.JACOB_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
 const PUBLIC_URL = process.env.JACOB_PUBLIC_URL || 'https://project-jacob.vercel.app';
+
+// Allowed values for the gen4_image model, from https://docs.dev.runwayml.com/api.md
+const RUNWAY_IMAGE_MODEL = 'gen4_image';
+const RUNWAY_IMAGE_RATIOS = new Set([
+  '1024:1024', '1080:1080', '1168:880', '1360:768', '1440:1080', '1080:1440', '1808:768', '1920:1080',
+  '1080:1920', '2112:912', '1280:720', '720:1280', '720:720', '960:720', '720:960', '1680:720'
+]);
+const RUNWAY_IMAGE_DEFAULT_RATIO = '1280:720';
+const RUNWAY_TASK_TIMEOUT_MS = 5 * 60 * 1000;
 
 function allowedOrigin(origin) {
   if (!origin) return '*';
@@ -148,6 +158,53 @@ async function speak(req, res, origin) {
   }
 }
 
+async function generateImage(req, res, origin) {
+  if (!requireAccessToken(req, res, origin)) return;
+  if (!process.env.RUNWAYML_API_SECRET) return sendJson(res, 503, { error: 'RUNWAYML_API_SECRET is not configured' }, origin);
+
+  let body;
+  try {
+    body = await readJson(req);
+  } catch (error) {
+    return sendJson(res, 400, { error: error.message }, origin);
+  }
+
+  const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+  const ratio = body.ratio ?? RUNWAY_IMAGE_DEFAULT_RATIO;
+  if (!prompt) return sendJson(res, 400, { error: 'Missing prompt' }, origin);
+  if (prompt.length > 1000) return sendJson(res, 413, { error: 'Prompt is too long' }, origin);
+  if (!RUNWAY_IMAGE_RATIOS.has(ratio)) return sendJson(res, 400, { error: 'Unsupported ratio', allowed: [...RUNWAY_IMAGE_RATIOS] }, origin);
+
+  // Stop polling Runway if the caller disconnects before the task finishes.
+  const abort = new AbortController();
+  res.on('close', () => abort.abort());
+
+  const created = new RunwayML().textToImage.create({ model: RUNWAY_IMAGE_MODEL, promptText: prompt, ratio });
+  // waitForTaskOutput() sleeps before awaiting the create request, so an early rejection (bad key, 4xx)
+  // would be unhandled and crash the process. Mark it handled; waitForTaskOutput() still rethrows it.
+  created.catch(() => {});
+
+  try {
+    const task = await created.waitForTaskOutput({ timeout: RUNWAY_TASK_TIMEOUT_MS, abortSignal: abort.signal });
+
+    // Output URLs expire within 24-48 hours; download them if they need to be kept.
+    sendJson(res, 200, { taskId: task.id, model: RUNWAY_IMAGE_MODEL, ratio, imageUrl: task.output[0] }, origin);
+  } catch (error) {
+    if (error instanceof AbortError) return;
+    if (error instanceof TaskFailedError) {
+      const { id, failureCode } = error.taskDetails;
+      console.error('Runway task failed', id, failureCode, error.taskDetails.failure);
+      return sendJson(res, 502, { error: 'Image generation failed', taskId: id, failureCode }, origin);
+    }
+    if (error instanceof TaskTimedOutError) {
+      return sendJson(res, 504, { error: 'Image generation timed out', taskId: error.taskDetails.id }, origin);
+    }
+    console.error('Runway error', error.status, error.message);
+    if (error.status === 429) return sendJson(res, 429, { error: 'Runway rate limit reached, try again shortly' }, origin);
+    sendJson(res, 502, { error: 'Runway request failed', upstreamStatus: error.status ?? null }, origin);
+  }
+}
+
 async function saveCheckIn(req, res, origin) {
   if (!requireAccessToken(req, res, origin)) return;
 
@@ -201,7 +258,8 @@ const server = http.createServer(async (req, res) => {
       dataDir: DATA_DIR,
       integrations: {
         openai: Boolean(process.env.OPENAI_API_KEY),
-        elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY)
+        elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY),
+        runway: Boolean(process.env.RUNWAYML_API_SECRET)
       }
     }, origin, { headOnly: isHead });
   }
@@ -215,7 +273,7 @@ const server = http.createServer(async (req, res) => {
       name: 'Project Jacob API',
       status: 'online',
       frontend: PUBLIC_URL,
-      endpoints: ['/health', 'POST /api/speak', 'POST /api/checkins']
+      endpoints: ['/health', 'POST /api/speak', 'POST /api/generate-image', 'POST /api/checkins']
     }, origin, { headOnly: isHead });
   }
 
@@ -225,6 +283,10 @@ const server = http.createServer(async (req, res) => {
 
   if (method === 'POST' && url.pathname === '/api/speak') {
     return speak(req, res, origin);
+  }
+
+  if (method === 'POST' && url.pathname === '/api/generate-image') {
+    return generateImage(req, res, origin);
   }
 
   if (method === 'POST' && url.pathname === '/api/checkins') {
